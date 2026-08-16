@@ -27,5 +27,5 @@ The multi-stage Dockerfile validates the NGINX configuration with `nginx -t`. En
 
 ## Canonical project material
 
-- [Documentation](../../docs/)
-- [Contracts](../../contracts/)
+- [Documentation](https://github.com/yemeal/andruha-messenger/tree/main/docs)
+- [Contracts](https://github.com/yemeal/andruha-messenger/tree/main/contracts)
