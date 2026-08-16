@@ -23,7 +23,12 @@ The image listens on port `8080`. Upstream hostnames are Docker Compose service 
 
 ## Local build and run status
 
-The multi-stage Dockerfile validates the NGINX configuration with `nginx -t`. End-to-end startup is deferred until the Python service dependency-bootstrap task is complete.
+The multi-stage Dockerfile validates the NGINX configuration with `nginx -t`.
+`.github/workflows/ci.yml` scans secrets, builds the validated runtime image,
+and smoke-tests health, request-ID replacement, and JSON 404 behavior.
+`.github/workflows/release.yml` publishes a verified image to GHCR only for a
+version tag. The root Compose workflow also checks the gateway together with
+the five runnable Python service images.
 
 ## Canonical project material
 

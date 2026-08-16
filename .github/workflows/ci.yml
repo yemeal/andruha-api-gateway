@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: local/${{ github.event.repository.name }}:ci
+
+jobs:
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan repository history
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  gateway:
+    name: NGINX validation and smoke test
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Validate configuration and build runtime image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test gateway behavior
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          container_name="${GITHUB_REPOSITORY##*/}-smoke-${GITHUB_RUN_ID}"
+          live_headers="$(mktemp)"
+          live_body="$(mktemp)"
+          not_found_headers="$(mktemp)"
+          not_found_body="$(mktemp)"
+
+          cleanup() {
+            exit_code=$?
+            if [ "${exit_code}" -ne 0 ]; then
+              docker logs "${container_name}" || true
+            fi
+            docker stop "${container_name}" >/dev/null 2>&1 || true
+            exit "${exit_code}"
+          }
+          trap cleanup EXIT
+
+          docker run --detach --rm \
+            --name "${container_name}" \
+            --publish 127.0.0.1:18080:8080 \
+            "${IMAGE_NAME}"
+
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:18080/health/live >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl --fail --silent --show-error \
+            --header 'X-Request-Id: client-controlled' \
+            --dump-header "${live_headers}" \
+            --output "${live_body}" \
+            http://127.0.0.1:18080/health/live
+          grep --quiet '"status":"ok"' "${live_body}"
+
+          gateway_request_id="$(
+            awk 'BEGIN { IGNORECASE=1 } /^X-Request-Id:/ { gsub("\r", ""); print $2 }' \
+              "${live_headers}"
+          )"
+          test -n "${gateway_request_id}"
+          test "${gateway_request_id}" != "client-controlled"
+
+          ready_status="$(
+            curl --silent --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              http://127.0.0.1:18080/health/ready
+          )"
+          test "${ready_status}" = "200"
+
+          not_found_status="$(
+            curl --silent --show-error \
+              --dump-header "${not_found_headers}" \
+              --output "${not_found_body}" \
+              --write-out '%{http_code}' \
+              http://127.0.0.1:18080/not-found
+          )"
+          test "${not_found_status}" = "404"
+          grep --ignore-case --quiet '^x-request-id:' "${not_found_headers}"
+          grep --quiet '"code":"gateway.route_not_found"' "${not_found_body}"
