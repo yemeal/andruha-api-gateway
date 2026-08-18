@@ -6,7 +6,7 @@ This repository contains the NGINX edge skeleton for Andruha Messenger. It curre
 
 ## Responsibility and non-responsibilities
 
-The gateway owns public transport routing, upstream forwarding, WebSocket upgrade headers, timeouts, and trusted request IDs. It does not validate JWTs, perform RBAC or session lookups, validate messenger domains, or implement business logic.
+The gateway owns public transport routing, upstream forwarding, WebSocket upgrade headers, timeouts, trusted request IDs, and mapping the HttpOnly `access_token` cookie into an internal `Authorization: Bearer` header. It intentionally overwrites any client-supplied `Authorization` header to prevent credentials spoofing. It does not validate JWTs, perform RBAC or session lookups, validate messenger domains, or implement business logic.
 
 ## Entrypoints
 
