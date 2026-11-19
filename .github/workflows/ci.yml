@@ -292,3 +292,18 @@ jobs:
           test "${not_found_status}" = "404"
           grep --ignore-case --quiet '^x-request-id:' "${not_found_headers}"
           grep --quiet '"code":"gateway.route_not_found"' "${not_found_body}"
+
+  # Required by the main branch ruleset.
+  docker-summary:
+    name: NGINX validation and smoke test
+    needs: [build, sast, image-scan, gateway]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require all prerequisite jobs to pass
+        shell: bash
+        env:
+          CI_RESULTS: ${{ toJSON(needs) }}
+        run: jq --exit-status 'length > 0 and all(.[]; .result == "success")' <<< "${CI_RESULTS}"
