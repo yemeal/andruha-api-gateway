@@ -4,7 +4,8 @@ on:
   workflow_call:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -16,6 +17,14 @@ concurrency:
 
 env:
   IMAGE_NAME: local/${{ github.event.repository.name }}:ci
+  DOCKER_BUILD_TARGET: runtime
+  SEMGREP_IMAGE: semgrep/semgrep:latest
+  SAST_BLOCKING_SEVERITY: ERROR
+  TRIVY_VERSION: latest
+  IMAGE_SCAN_SEVERITY: HIGH,CRITICAL
+  IMAGE_SCAN_TIMEOUT: 5m
+  REPORT_RETENTION_DAYS: "7"
+  BUILD_ARTIFACT_RETENTION_DAYS: "1"
 
 jobs:
   secret-scan:
@@ -24,46 +33,199 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-
     steps:
       - name: Checkout full history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
+          persist-credentials: false
       - name: Scan repository history
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_COMMENTS: "false"
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
 
-  gateway:
-    name: NGINX validation and smoke test
-    needs: secret-scan
+  build:
+    name: Docker Build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
+    timeout-minutes: 25
+    needs:
+      - secret-scan
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Validate configuration and build runtime image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/setup-buildx-action@v4
+      - name: Build runtime image
+        uses: docker/build-push-action@v7
         with:
           context: .
-          target: runtime
+          target: ${{ env.DOCKER_BUILD_TARGET }}
           push: false
           load: true
           tags: ${{ env.IMAGE_NAME }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Export built image
+        run: docker image save --output "${RUNNER_TEMP}/runtime-image.tar" "${IMAGE_NAME}"
+      - name: Upload built image
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-image
+          path: ${{ runner.temp }}/runtime-image.tar
+          if-no-files-found: error
+          retention-days: ${{ env.BUILD_ARTIFACT_RETENTION_DAYS }}
+          overwrite: true
 
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Checkout current security rules
+        uses: actions/checkout@v7
+        with:
+          repository: semgrep/semgrep-rules
+          path: .semgrep-rules
+          sparse-checkout: ${{ env.SEMGREP_RULES }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+      - name: Scan source code
+        run: |
+          set -Eeuo pipefail
+          report_dir="${RUNNER_TEMP}/semgrep"
+          mkdir -p "${report_dir}"
+
+          rule_args=()
+          while IFS= read -r rule; do
+            rule_args+=(--config "/rules/${rule}")
+          done <<< "${SEMGREP_RULES}"
+
+          mapfile -t targets <<< "${SAST_TARGETS}"
+          docker run --rm --pull always --network none \
+            --volume "${GITHUB_WORKSPACE}:/src:ro" \
+            --volume "${GITHUB_WORKSPACE}/.semgrep-rules:/rules:ro" \
+            --volume "${report_dir}:/reports" \
+            --workdir /src \
+            "${SEMGREP_IMAGE}" semgrep scan "${rule_args[@]}" \
+            --metrics off --disable-version-check --no-git-ignore \
+            --exclude tests --exclude scripts --exclude .venv \
+            --json --output /reports/semgrep.json --sarif-output /reports/semgrep.sarif \
+            "${targets[@]}"
+        id: sast-scan
+        shell: bash
+      - name: Enforce SAST policy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          report="${RUNNER_TEMP}/semgrep/semgrep.json"
+
+          if ! jq -e 'all(.errors[];
+            .level == "warn" and
+            ((.type | if type == "array" then .[0] else . end) == "PartialParsing")
+          )' "${report}" > /dev/null; then
+            echo "::error::Semgrep reported analysis errors. See the semgrep-sast artifact."
+            exit 1
+          fi
+
+          partial_count="$(jq '.errors | length' "${report}")"
+          if (( partial_count > 0 )); then
+            echo "::warning::Semgrep reported ${partial_count} partial parse warnings. See the semgrep-sast artifact."
+          fi
+
+          if ! jq -e --arg severity "${SAST_BLOCKING_SEVERITY}" \
+            'all(.results[]; .extra.severity != $severity)' "${report}" > /dev/null; then
+            echo "::error::Semgrep found issues at ${SAST_BLOCKING_SEVERITY}. See the semgrep-sast artifact."
+            exit 1
+          fi
+      - name: Upload SAST report
+        uses: actions/upload-artifact@v7
+        if: ${{ always() && steps.sast-scan.outcome != 'skipped' }}
+        with:
+          name: semgrep-sast
+          path: ${{ runner.temp }}/semgrep/semgrep.sarif
+          if-no-files-found: error
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
+          overwrite: true
+    env:
+      SEMGREP_RULES: |-
+        generic/nginx/security
+      SAST_TARGETS: |-
+        nginx.conf
+        proxy-common.conf
+
+  image-scan:
+    name: SCA (Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - build
+    steps:
+      - name: Download built image
+        uses: actions/download-artifact@v8
+        with:
+          name: runtime-image
+          path: ${{ runner.temp }}/image
+      - name: Load built image
+        run: docker image load --input "${RUNNER_TEMP}/image/runtime-image.tar"
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+      - name: Scan runtime image and enforce fixable CVE policy
+        id: image-scan
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          raw_report="${RUNNER_TEMP}/trivy-raw.json"
+          trivy image --image-src docker --scanners vuln,secret \
+            --pkg-types os,library --format json --timeout "${IMAGE_SCAN_TIMEOUT}" \
+            --output "${raw_report}" "${IMAGE_NAME}"
+          jq 'del(.Metadata.ImageConfig) | (.Results[]?.Secrets[]?) |=
+              {RuleID, Category, Severity, Title, StartLine, EndLine}' \
+            "${raw_report}" > "${RUNNER_TEMP}/trivy-image.json"
+
+          trivy image --image-src docker --scanners vuln \
+            --pkg-types os,library --severity "${IMAGE_SCAN_SEVERITY}" \
+            --ignore-unfixed --exit-code 1 --skip-db-update --timeout "${IMAGE_SCAN_TIMEOUT}" \
+            "${IMAGE_NAME}"
+      - name: Upload image security report
+        if: ${{ always() && steps.image-scan.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-image-${{ github.event.repository.name }}
+          path: ${{ runner.temp }}/trivy-image.json
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
+          if-no-files-found: error
+          overwrite: true
+
+  gateway:
+    name: Smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs:
+      - build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download built image
+        uses: actions/download-artifact@v8
+        with:
+          name: runtime-image
+          path: ${{ runner.temp }}/image
+      - name: Load built image
+        run: docker image load --input "${RUNNER_TEMP}/image/runtime-image.tar"
       - name: Smoke-test gateway behavior
         shell: bash
         run: |
@@ -130,3 +292,18 @@ jobs:
           test "${not_found_status}" = "404"
           grep --ignore-case --quiet '^x-request-id:' "${not_found_headers}"
           grep --quiet '"code":"gateway.route_not_found"' "${not_found_body}"
+
+  # Required by the main branch ruleset.
+  docker-summary:
+    name: NGINX validation and smoke test
+    needs: [build, sast, image-scan, gateway]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require all prerequisite jobs to pass
+        shell: bash
+        env:
+          CI_RESULTS: ${{ toJSON(needs) }}
+        run: jq --exit-status 'length > 0 and all(.[]; .result == "success")' <<< "${CI_RESULTS}"
